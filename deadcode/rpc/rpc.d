@@ -3,6 +3,7 @@ module deadcode.rpc.rpc;
 import msgpack;
 
 import core.thread : Fiber;
+import std.array;
 import std.conv;
 import std.stdio;
 import std.traits;
@@ -10,8 +11,12 @@ import std.typecons;
 import std.typetuple;
 
 import deadcode.core.future;
+import deadcode.core.signals;
+//import deadcode.core.weakref : WeakRef;
 import deadcode.rpc.rpcproxy : RPCProxy, getAllMethods, generateMethodImplementations, CreateFunction, JoinStrings, ParameterTuple;
 import deadcode.rpc.rpctransport : RPCTransport;
+
+import deadcode.util.weakref : WeakRef;
 
 alias CallID = string;
 alias RPCAsyncCallback = Promise!Unpacker;
@@ -26,11 +31,12 @@ class RPC
     }
 
     import std.array;
-    RPCTransport _transport; // null when this RPC is killed
+    private RPCTransport _transport; // null when this RPC is killed
     ubyte[64*1024] inBuffer;
     Appender!(ubyte[]) outBuffer;
     
-    IRPCService[string] _services;
+    // private Object[string] _publishedServices;      // to keep weakrefs alive for published services 
+    package IRPCService[string] _services;  // used by rpcproxy therefore package
 
     private struct RPCCallbackInfo
     {
@@ -40,6 +46,8 @@ class RPC
 
     RPCCallbackInfo[CallID] rpcCallbacks;
     ulong sNextCallID = 1;
+
+    mixin Signal!(RPC) onKilled;
 
     @property bool waitForReceive() 
     {
@@ -70,11 +78,12 @@ class RPC
         {
             auto t = _transport;
             _transport = null;
-            _services = null;
             Exception e = new Exception("Aborting RPC because of rpc.kill()");
             foreach (k,v; rpcCallbacks)
                 remoteCallAbort(k, e);
             t.kill();
+            onKilled.emit(this);
+            _services = null;
         }
     }
 
@@ -102,7 +111,8 @@ class RPC
         auto recvLength = _transport.receive(inBuffer[0..4]);
         if (recvLength == RPCTransport.ReceiveError || recvLength == 0)
         {
-            _transport.kill();
+            kill();
+            // _transport.kill();
             return recvLength;
         }
 
@@ -110,7 +120,8 @@ class RPC
         auto recvLength2 = _transport.receive(inBuffer[0..l]);
         if (recvLength2 == RPCTransport.ReceiveError || recvLength2 == 0)
         {
-            _transport.kill();
+            kill();
+            //_transport.kill();
             return recvLength2;
         }
 
@@ -215,13 +226,41 @@ class RPC
         return i;
     }
 
+    RPCProxy!I createReference(I)() if (is (I == interface))
+    {
+        enum serviceID = fullyQualifiedName!I;
+        //pragma(msg, I);
+        assert(isAlive);
+        auto i = new RPCProxy!I(this, pack(serviceID));
+        return i;
+    }
+
+    //auto publish(T)(T service, string id)
+    //{
+    //    //_publishedServices[id] = cast(Object)service;
+    //    return weakPublish(service, id);
+    //}
+
     auto publish(T)(T service, string id)
     {
         //pragma(msg, T);
-        alias Interfaces = InterfacesTuple!T;
-        static assert(Interfaces.length == 1, "RPC.publish can only publish classes deriving exactly one interface");
-        return publish!(Interfaces[0], T)(service, id);
+        static if (is (T == interface))
+        {
+            return publish!(T, T)(service, id);
+        }
+        else
+        {
+            alias Interfaces = InterfacesTuple!T;
+            static assert(Interfaces.length == 1, "RPC.publish can only publish classes deriving exactly one interface");
+            return publish!(Interfaces[0], T)(service, id);
+        }
     }
+
+    //RPCService!(Interface) publish(Interface, T : Interface)(T service, string serviceID) if (is(Interface == interface))
+    //{
+    //    _publishedServices[serviceID] = service;
+    //    return weakPublish!(Interface, T)(service, serviceID);
+    //}
 
     RPCService!(Interface) publish(Interface, T : Interface)(T service, string serviceID) if (is(Interface == interface))
     {
@@ -229,8 +268,88 @@ class RPC
         assert(isAlive);
         auto i = new RPCService!(Interface)(this, service, pack(serviceID));
         _services[serviceID] = i;
+        //IRPCService ii = i;
+        //_services[serviceID] = new WeakRef!IRPCService(ii);
         return i;
     }
+
+    auto publish(T)(T service)
+    {
+        //pragma(msg, T);
+        static if (is (T == interface))
+        {
+            return publish!(T, T)(service);
+        }
+        else
+        {
+            alias Interfaces = InterfacesTuple!T;
+            static assert(Interfaces.length == 1, "RPC.publish can only publish classes deriving exactly one interface");
+            return publish!(Interfaces[0], T)(service);
+        }
+    }
+
+    RPCService!(Interface) publish(Interface, T : Interface)(T service) if (is(Interface == interface))
+    {
+        enum serviceID = fullyQualifiedName!Interface;
+        return publish!(Interface, T)(service, serviceID);
+    }
+
+    void unpublish(Object o)
+    {
+        bool didRemove = true;
+        while (didRemove)
+        {
+            didRemove = false;
+            foreach (k, v; _services)
+            {
+                if (v.obj is o)
+                {
+                    _services.remove(k);
+                    didRemove = true;
+                }
+            }
+        }
+        //foreach (k, v; _publishedServices)
+        //{
+        //    if (v is o)
+        //    {
+        //        _publishedServices.remove(k);
+        //        _services.remove(k);
+        //    }
+        //}
+    }
+
+    void unpublish(string serviceID)
+    {
+        _services.remove(serviceID);
+
+        //foreach (k, v; _publishedServices)
+        //{
+        //    if (serviceID == k)
+        //    {
+        //        _publishedServices.remove(k);
+        //        _services.remove(k);
+        //    }
+        //}
+    }
+
+    // Remove weak references to deletes service objects.
+    // Service objects that are not explicitly published but
+    // automatically published because an object is passed as argument
+    // to a function and that object is not already published are
+    // only stored as weak object (ie. weak services). As soon as
+    // the object is deleted is cannot be used as a service anymore.
+    //void cleanupWeakRefs()
+    //{
+    //    foreach (i; _services.byKeyValue.array)
+    //    {
+    //        if (i.value.get() is null)
+    //        {
+    //            assert( (i.key in _publishedServices) is null); 
+    //            _services.remove(i.key);
+    //        }
+    //    }
+    //}
 
     private ubyte[] encodeLen(uint l)
     {
@@ -281,10 +400,10 @@ class RPCService(I) : IRPCService, I
         ubyte[] _id;
     }
 
-    this(RPC rpc, Object o, ubyte[] id)
+    this(O)(RPC rpc, O o, ubyte[] id) if (is(O == class) || is (O == interface))
     {
         _rpc = rpc;
-        _obj = o;
+        _obj = cast(Object)o;
         _id = id;
     }
     
@@ -427,16 +546,26 @@ class RPCService(I) : IRPCService, I
                     {
                         //if (hasMember!(Returning, "id"))
                         //{
-                        ubyte[] id = pack("");
+                        ubyte[] id = null;
                         foreach (_service; _rpc._services)
                         {
                             // auto returnObj = cast(typeof(result))_service._obj;
-                            if ( result == _service.obj)
+                            auto srv = _service; // .get();
+                            if ( result == srv.obj)
                             {
-                                id = _service.packedID;
+                                id = srv.packedID;
                                 break;
                             }
                         }
+    
+                        if (id.empty)
+                        {
+                            import std.conv;
+                            Object o = cast(Object)result;
+                            auto ws = _rpc.publish(result, o.toHash().to!string);
+                            id = ws.packedID;
+                        }
+
                         resultData ~= id;
                         //}
                         //else

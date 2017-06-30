@@ -158,38 +158,27 @@ class RPCLoop
 
     final int select()
     {
-        import std.algorithm : remove;
-        
         _socketSet.reset();
         
-        for (size_t i = 0; i < _clients.length; ++i)
-        {
-            auto client = _clients[i];
-            
-            if (!client.rpc.isAlive || !client.socket.isAlive)
-            {
-                _clients = _clients.remove(i);
-                i--;
-            }
-            else if (client.rpc.waitForReceive)
-            {  
-                _socketSet.add(client.socket);
-            }
-        }
-
-        if (_sock !is null)
-            _socketSet.add(_sock); // listening socket
-        else if (_clients.length == 0)
+        if (!addSockets(_socketSet))
             return 0;
 
-        import std.stdio;
+       
         //string me = _sock !is null ? _sock.localAddress.toString() : "not listening";
         //writeln("Selecting ", me);
         int selectResult = Socket.select(_socketSet, null, null);
 
+        processSockets(_socketSet);
+
+        return selectResult;
+    }
+
+    final void processSockets(SocketSet socketSet)
+    {
+        import std.stdio;
         foreach (size_t i, client; _clients)
         {
-            if (_socketSet.isSet(client.socket))
+            if (socketSet.isSet(client.socket))
             {
                 auto recvLength = client.rpc.receiveMessage();
                 if (recvLength == Socket.ERROR)
@@ -200,19 +189,19 @@ class RPCLoop
                 {
                     if (client.rpc.isAlive)
                     {
-                        writeln("Client disconnected");
+                        //debug writeln("Client disconnected");
                         onDisconnected.emit(client.rpc, "Remote end disconnected before receiving message finished");
                     }
                     else
                     {
-                        writeln("Client disconnected by kill");
+                        //debug writeln("Client disconnected by kill");
                         onDisconnected.emit(client.rpc, "Disconnect caused by rpc.kill()");
                     }
                 }
             }
         }
 
-        if (_sock !is null && _socketSet.isSet(_sock))
+        if (_sock !is null && socketSet.isSet(_sock))
         {
             Socket clientSocket = null;
             scope (failure)
@@ -226,7 +215,40 @@ class RPCLoop
             else 
                 registerConnection(clientSocket, true);
         }
-        return selectResult;
+    }
+
+    bool addSockets(T)(ref T outputSockets)
+    {
+        import std.algorithm : remove;
+        
+        for (size_t i = 0; i < _clients.length; ++i)
+        {
+            auto client = _clients[i];
+
+            if (!client.rpc.isAlive || !client.socket.isAlive)
+            {
+                _clients = _clients.remove(i);
+                i--;
+            }
+            else if (client.rpc.waitForReceive)
+            {  
+                static if ( is(T == SocketSet) )
+                    outputSockets.add(client.socket);
+                else
+                    outputSockets ~= client.socket.handle;
+            }
+        }
+
+        if (_sock !is null)
+        {
+            static if ( is(T == SocketSet) )
+                outputSockets.add(_sock); // listening socket
+            else
+                outputSockets ~= _sock.handle;
+        }
+        else if (_clients.length == 0)
+            return false;
+        return true;
     }
 
     // incoming is false in case this transport initiated the connection

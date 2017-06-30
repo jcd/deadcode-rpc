@@ -4,19 +4,22 @@ import msgpack;
 
 import deadcode.core.future;
 import deadcode.rpc.rpc;
+//import deadcode.util.weakref : WeakRef;
 
 class RPCProxyBase
 {
     private
     {
-        RPC rpc;
+        RPC _rpc;
         ubyte[] packedType;
         ubyte[] packedID;
     }
 
-    private this(RPC rpc, ubyte[] packedType, ubyte[] packedID)
+    final @property RPC rpc() { return _rpc; }
+
+    private this(RPC _rpc, ubyte[] packedType, ubyte[] packedID)
     {
-        this.rpc = rpc;
+        this._rpc = _rpc;
         this.packedType = packedType;
         this.packedID = packedID;
     }
@@ -35,40 +38,60 @@ class RPCProxyBase
 
     private final auto asyncCallInternal(bool yieldCall = false, Args...)(string methodName, Args args)
     {
+        import core.thread : Fiber;
         CallID callID = _setupRPCCall(methodName);
 
         foreach (a; args)
         {
             version (RPCTrace)
                 writeln("Arg: ", a);
-			static if (is(typeof(a) == interface))
+            alias ArgType = typeof(a);
+			static if (is(ArgType == interface))
             {
-				auto proxyCasted = cast(RPCProxy!(typeof(a))) a;
+				auto proxyCasted = cast(RPCProxy!ArgType) a;
                 if (proxyCasted is null)
                 {
-                    auto serviceCasted = cast(RPCService!(typeof(a))) a; 
+                    alias ServiceType = RPCService!ArgType;
+//                    alias WeakServiceType = WeakRef!ServiceType;
+
+                    auto serviceCasted = cast(ServiceType) a; 
                     if (serviceCasted is null)
                     {
-                        bool ok = false;
-                        foreach (service; rpc._services)
-                        {
-                            if (a == service.obj)
+                        //auto weakServiceCasted = cast(WeakServiceType) a; 
+                        //if (weakServiceCasted is null)
+                        //{
+                            // We have a plain object. Search for it in the services list
+                            bool ok = false;
+                            foreach (service; rpc._services)
                             {
-                                rpc.outBuffer ~= service.packedID;
-                                ok = true;
-                                break;
+                                auto so = service; // .get();
+                                if (/*so !is null && */ so.obj == a)
+                                {
+                                    rpc.outBuffer ~= so.packedID;
+                                    ok = true;
+                                    break;
+                                }
                             }
-                        }
-                        if (!ok)
-                        {
-                            import std.stdio;
-                            writeln("RPC method interface arg is not proxy, service or object in a service but : ", methodName, " ", a);
-                        }
+                            if (!ok)
+                            {
+                                // Wrap the object in a weak reference and make it a service automatically
+                                import std.conv;
+                                Object o = cast(Object)a;
+                                auto ws = rpc.publish(a, o.toHash().to!string);
+                                rpc.outBuffer ~= ws.packedID;
+                                //import std.stdio;
+                                //writeln("RPC method interface arg is not proxy, service or object in a service but : ", methodName, " ", a);
+                            }
+                    //    }
+                    //    else
+                    //    {
+                    //        rpc.outBuffer ~= weakServiceCasted.get().packedID;
+                    //    }
                     }
                     else
                     {
                         rpc.outBuffer ~= serviceCasted.packedID;
-                    }                
+                    }
                 }
                 else
                 {
@@ -190,25 +213,29 @@ mixin template CreateFunction(alias TemplateFunc, string functionBody)
     enum funcAttrs = JoinStrings!(0, __traits(getFunctionAttributes, TemplateFunc));
     //pragma(msg, "FuncAttrs ", funcAttrs);
     //pragma(msg, fullyQualifiedName!TemplateFunc);
-
-    mixin(q{ReturnType!(TemplateFunc) %s(ParameterTuple!TemplateFunc) %s { 
+    enum code = q{ReturnType!(TemplateFunc) %s(ParameterTuple!TemplateFunc) %s { 
         %s
-    }}.format(__traits(identifier, TemplateFunc), funcAttrs, functionBody.format(fullyQualifiedName!TemplateFunc)));
+    }}.format(__traits(identifier, TemplateFunc), funcAttrs, functionBody.format("TemplateFunc" /*fullyQualifiedName!TemplateFunc*/));
+    mixin(code);
 }
 
 template getAllMethods(I)
 {
     import std.traits;
     import std.typetuple;
+    import deadcode.core.traits : isMemberAccessible;
+
     enum allMembers = [ __traits(allMembers, I) ];
 
     template Impl(int idx)
     {
-        static if (allMembers.length != idx)
+        static if (allMembers.length == idx)
+            alias Impl = TypeTuple!();
+        else static if (isMemberAccessible!(I, allMembers[idx]) && isCallable!(mixin("I."~allMembers[idx])))
             alias Impl = TypeTuple!(MemberFunctionsTuple!(I, allMembers[idx]), Impl!(idx + 1));
         else
-            alias Impl = TypeTuple!();
-        
+            alias Impl = Impl!(idx + 1); // skip template methods
+
     }
     alias getAllMethods = Impl!0;
 }
@@ -216,7 +243,7 @@ template getAllMethods(I)
 string generateMethodImplementations(allMethods...)(string methodBody)
 {
     import std.string :  format;
-    string res;
+    string res = "import std.traits : Identity;";
     foreach (idx, f; allMethods)
     {
         res ~= q{ 
@@ -236,18 +263,19 @@ class RPCProxy(I) : RPCProxyBase, I
     }
 
     // Get all members of interface I and generate a method body that simply 
-    // forwards as a rpc call.
+    // forwards as a rpc call. Skip interface template methods though, because that
+    // doesn't make sense to proxy
     alias allMethods = getAllMethods!I;
 
     enum code = generateMethodImplementations!allMethods(RPCProxyMethodMixin);
     mixin(code);
 }
-
+ // Identity!(%s);
 enum RPCProxyMethodMixin = q{
     import std.array;
     import std.traits;
     import std.typetuple;
-    alias Func = Identity!(%s);
+    alias Func = %s;
     enum Name = __FUNCTION__.split(".")[$-1];
     alias ArgsIdents = ParameterIdentifierTuple!Func;
 
