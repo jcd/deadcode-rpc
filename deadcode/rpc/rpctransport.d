@@ -131,7 +131,7 @@ class RPCLoop
 
     final void kill(Socket socket)
     {
-        int idx = -1;
+        size_t idx = -1;
         foreach (i, v; _clients)
         {
             if (v.socket is socket)

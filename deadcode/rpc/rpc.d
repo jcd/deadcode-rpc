@@ -351,10 +351,12 @@ class RPC
     //    }
     //}
 
-    private ubyte[] encodeLen(uint l)
+    private ubyte[] encodeLen(size_t l)
     {
         static uint r;
-        r = l;
+        import std.exception;
+        enforce(l < uint.max);
+        r = cast(uint)l;
         ubyte* lenubyte = cast(ubyte*)&r;
         return lenubyte[0..4];
     }
