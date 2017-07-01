@@ -3,7 +3,8 @@ d:
  - dmd
  - ldc
 script:
- - cat dub.json | perl -ne 'print if s/.*\"(deadcode-.*)\"\s*?:.*/\1/' | while read N ; do git clone https://github.com/jcd/$N.git $N ; dub add-local $N ; done
+ - git clone https://github.com/jcd/deadcode-dev-ci.git citools
+ - perl citools/clone-dub-deps.pl
  - dub test -b unittest-cov --compiler=${DC}
 after_success:
  - bash <(curl -s https://codecov.io/bash)
