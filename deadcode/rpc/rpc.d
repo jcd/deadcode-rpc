@@ -13,6 +13,7 @@ import std.typetuple;
 import deadcode.core.future;
 import deadcode.core.signals;
 //import deadcode.core.weakref : WeakRef;
+import deadcode.rpc.rpccallback;
 import deadcode.rpc.rpcproxy : RPCProxy, getAllMethods, generateMethodImplementations, CreateFunction, JoinStrings, ParameterTuple;
 import deadcode.rpc.rpctransport : RPCTransport;
 
@@ -20,6 +21,54 @@ import deadcode.util.weakref : WeakRef;
 
 alias CallID = string;
 alias RPCAsyncCallback = Promise!Unpacker;
+
+struct RPCBuffer
+{
+	import core.memory;
+	this(size_t initialSize)
+	{
+		data = cast(ubyte*)pureMalloc(initialSize);
+		capacity = initialSize;
+		used = 0;
+	}
+	~this()
+	{
+		if (data !is null)
+		{
+			import core.stdc.stdlib : free;
+			//pureFree(data);
+			free(data);
+			data = null;
+			used = 0;
+			capacity = 0;
+		}
+	}
+	void reserve(size_t sz)
+	{
+		if (capacity < sz)
+		{
+			data = cast(ubyte*)pureRealloc(data, sz);
+			capacity = sz;
+		}
+	}
+	ubyte* data;
+	size_t capacity;
+	size_t used;
+}
+
+class RPCSocketBuffer
+{
+	import std.socket;
+	this(socket_t _handle, size_t initialSize)
+	{
+		handle = _handle;
+		messageSize = 0;
+		buffer = RPCBuffer(initialSize);
+	}
+	socket_t handle;
+	size_t messageSize;
+	RPCBuffer buffer;
+}
 
 class RPC
 {
@@ -32,7 +81,7 @@ class RPC
 
     import std.array;
     private RPCTransport _transport; // null when this RPC is killed
-    ubyte[64*1024] inBuffer;
+    RPCSocketBuffer inBuffer;
     Appender!(ubyte[]) outBuffer;
     
     // private Object[string] _publishedServices;      // to keep weakrefs alive for published services 
@@ -70,19 +119,25 @@ class RPC
     {
         _transport = transport;
         outBuffer = appender!(ubyte[]);
+		inBuffer =  new RPCSocketBuffer(_transport._socket.handle, 1024);
     }
+
+	string getErrorText()
+	{
+		return _transport._socket.getErrorText();
+	}
 
     void kill()
     {
         if (isAlive)
         {
+            onKilled.emit(this);
             auto t = _transport;
             _transport = null;
             Exception e = new Exception("Aborting RPC because of rpc.kill()");
             foreach (k,v; rpcCallbacks)
                 remoteCallAbort(k, e);
             t.kill();
-            onKilled.emit(this);
             _services = null;
         }
     }
@@ -105,10 +160,35 @@ class RPC
         _transport.send(packedData);
     }
 
+	final void processMessageBuffer()
+    {
+        assert(isAlive);
+		
+		if (inBuffer.buffer.used == 0)
+			return;
+
+        auto unpacker = Unpacker(inBuffer.buffer.data[0..inBuffer.messageSize]);
+		
+		inBuffer.buffer.data[0..inBuffer.buffer.used-inBuffer.messageSize] = 
+			inBuffer.buffer.data[inBuffer.messageSize..inBuffer.buffer.used];
+		inBuffer.buffer.used -= inBuffer.messageSize;
+		inBuffer.messageSize = 0;
+
+        CallID callID;
+        unpacker.unpack(callID);
+        bool isRequest;
+        unpacker.unpack(isRequest);
+
+        if (isRequest)
+            incomingCall(callID, unpacker);
+        else
+            remoteCallReturned(callID, unpacker);
+	}
+
     ptrdiff_t receiveMessage()
     {
         assert(isAlive);
-        auto recvLength = _transport.receive(inBuffer[0..4]);
+        auto recvLength = _transport.receive(inBuffer.buffer.data[0..4]);
         if (recvLength == RPCTransport.ReceiveError || recvLength == 0)
         {
             kill();
@@ -116,8 +196,11 @@ class RPC
             return recvLength;
         }
 
-        auto l = decodeLen(inBuffer);
-        auto recvLength2 = _transport.receive(inBuffer[0..l]);
+        auto l = decodeLen(inBuffer.buffer.data[0..4]);
+		inBuffer.buffer.reserve(l);
+		inBuffer.buffer.used = l;
+		inBuffer.messageSize = l;
+        auto recvLength2 = _transport.receive(inBuffer.buffer.data[0..l]);
         if (recvLength2 == RPCTransport.ReceiveError || recvLength2 == 0)
         {
             kill();
@@ -127,16 +210,7 @@ class RPC
 
         recvLength += recvLength2;
 
-        auto unpacker = Unpacker(inBuffer[0..l]);
-        CallID callID;
-        unpacker.unpack(callID);
-        bool isRequest;
-        unpacker.unpack(isRequest);
-        
-        if (isRequest)
-            incomingCall(callID, unpacker);
-        else
-            remoteCallReturned(callID, unpacker);
+		processMessageBuffer();
         
         return recvLength;
     }
@@ -169,7 +243,7 @@ class RPC
             auto f = new Fiber( () {
                 incomingCallNewFiber(callID, unpacker);
             });
-            f.call();
+            f.call(); 
         //}
         //else
         //{
@@ -214,6 +288,8 @@ class RPC
     {
         string id;
         unpacker.unpack(id);
+        if (id is null)
+            return null;
         auto i = new RPCProxy!I(this, pack(id));
         return i;
     }
@@ -384,12 +460,14 @@ private template paramTypesToUnpackTypes(Types...)
     {
         static if (is(Types[0] == interface))
             alias paramTypesToUnpackTypes = string;
+        else static if (isDelegate!(Types[0]))
+            alias paramTypesToUnpackTypes = string;
         else
             alias paramTypesToUnpackTypes = Types[0];
     }
     else
     {
-        alias paramTypesToUnpackTypes = AliasSeq!(paramTypesToUnpackTypes!(Types[0]), Types[1..$]);
+        alias paramTypesToUnpackTypes = AliasSeq!(paramTypesToUnpackTypes!(Types[0]), paramTypesToUnpackTypes!(Types[1..$]));
     }
 }
 
@@ -409,6 +487,11 @@ class RPCService(I) : IRPCService, I
         _id = id;
     }
     
+	@property RPC rpc()
+	{
+		return _rpc;
+	}
+
     @property Object obj()
     {
         return _obj;
@@ -453,11 +536,40 @@ class RPCService(I) : IRPCService, I
             {
                 auto service = up[i] in _rpc._services;
                 if (service is null)
-                    params[i] = _rpc.createReference!ParamType(up[i]);
+                {
+                    if (up[i].empty)
+                        params[i] = null;
+                    else
+                        params[i] = _rpc.createReference!ParamType(up[i]);
+                }
                 else
-                    params[i] = cast(ParamType) *service;
+                {
+                    params[i] = cast(ParamType) service.obj;
+                }
             }
-            else
+			else static if (isDelegate!ParamType)
+            {
+				// We should have received a RPCProxy!ICallback
+                // TODO: Could actually stitch services together here
+				//       by using the service.obj which is local to 
+				//       use as paramter for a local function. ie. no overhead
+				//       connection.
+				if (up[i].empty)
+				{
+                    params[i] = null;
+				}
+                else
+				{
+					alias DlgParams = Parameters!ParamType;
+					static if (is(ReturnType!ParamType == void))
+						alias DlgProxy = ICallback!DlgParams;
+					else
+						alias DlgProxy = ICallbackReturn!(ReturnType!ParamType, DlgParams);
+					auto remoteCallbackObject = _rpc.createReference!DlgProxy(up[i]);
+                    params[i] = &remoteCallbackObject.call;
+				}
+			}
+			else
             {
                 params[i] = up[i];
             }
@@ -472,13 +584,55 @@ class RPCService(I) : IRPCService, I
 
         string methodName;
         unpacker.unpack(methodName);
+        byte argCount;
+        unpacker.unpack(argCount);
+
+        static void appendServiceID(E)(E r, RPC __rpc, ref ubyte[] _resultData)
+        {
+            //if (hasMember!(Returning, "id"))
+            //{
+            ubyte[] id = null;
+            foreach (_service; __rpc._services)
+            {
+                // auto returnObj = cast(typeof(result))_service._obj;
+                auto srv = _service; // .get();
+                if ( r == srv.obj)
+                {
+                    id = srv.packedID;
+                    break;
+                }
+            }
+
+            if (id.empty)
+            {
+                import std.conv;
+                Object o = cast(Object)r;
+                if (o is null)
+                {
+                    string nullString;
+                    id = pack(nullString);
+                }
+                else
+                {
+                    auto ws = __rpc.publish(r, o.toHash().to!string);
+                    id = ws.packedID;
+                }
+            }
+
+            _resultData ~= id;
+            //}
+            //else
+            //{
+            //    pragma(msg, "Trying to RPC return class with no id property: ", Returning.stringof);
+            //}                        
+        }
 
         foreach (Method; allMethods)
         {
-            if (__traits(identifier, Method) == methodName)
+            alias ParamTypes = Parameters!(Method);
+            if (__traits(identifier, Method) == methodName && ParamTypes.length == argCount)
             {
                 enum MethodName = __traits(identifier, Method);
-                alias ParamTypes = Parameters!(Method);
                 alias ParamUnpackTypes = paramTypesToUnpackTypes!ParamTypes;
                 // alias ParamIdents = ParameterIdentifierTuple!(Method);
                 // enum ParamCount = ParamTypes.length;
@@ -539,41 +693,44 @@ class RPCService(I) : IRPCService, I
                     else
                         auto result = __traits(getMember, obj, MethodName)(params[0], params[1], params[2]);
                 }
+                else static if (ParamTypes.length == 4)
+                {
+                    ParamUnpackTypes unpackParams;
+                    unpacker.unpack(unpackParams);
+                    auto up  = tuple(unpackParams);
+                    Tuple!ParamTypes params = lookupObjectParams!(typeof(up), ParamTypes)(up);
+                    static if (is(Returning : void))
+                        __traits(getMember, obj, MethodName)(params[0], params[1], params[2], params[3]);
+                    else
+                        auto result = __traits(getMember, obj, MethodName)(params[0], params[1], params[2], params[3]);
+                }
+                else static if (ParamTypes.length == 5)
+                {
+                    ParamUnpackTypes unpackParams;
+                    unpacker.unpack(unpackParams);
+                    auto up  = tuple(unpackParams);
+                    Tuple!ParamTypes params = lookupObjectParams!(typeof(up), ParamTypes)(up);
+                    static if (is(Returning : void))
+                        __traits(getMember, obj, MethodName)(params[0], params[1], params[2], params[3], params[4]);
+                    else
+                        auto result = __traits(getMember, obj, MethodName)(params[0], params[1], params[2], params[3], params[4]);
+                }
 
                 // Serialize result. also convert know object types to ids.
-
+                import std.range;
                 static if (!is(Returning : void))
                 {
                     static if (is(Returning == interface))
                     {
-                        //if (hasMember!(Returning, "id"))
-                        //{
-                        ubyte[] id = null;
-                        foreach (_service; _rpc._services)
-                        {
-                            // auto returnObj = cast(typeof(result))_service._obj;
-                            auto srv = _service; // .get();
-                            if ( result == srv.obj)
-                            {
-                                id = srv.packedID;
-                                break;
-                            }
-                        }
-    
-                        if (id.empty)
-                        {
-                            import std.conv;
-                            Object o = cast(Object)result;
-                            auto ws = _rpc.publish(result, o.toHash().to!string);
-                            id = ws.packedID;
-                        }
-
-                        resultData ~= id;
-                        //}
-                        //else
-                        //{
-                        //    pragma(msg, "Trying to RPC return class with no id property: ", Returning.stringof);
-                        //}
+                        appendServiceID!Returning(result, _rpc, resultData);
+                    }
+                    else static if ( isRandomAccessRange!Returning && is(ElementType!Returning == interface))
+                    {
+                        alias ElmType = ElementType!Returning;
+                        int sz = result.length;
+                        resultData ~= pack(sz);
+                        foreach (v; result)
+                            appendServiceID!ElmType(v, _rpc, resultData);
                     }
                     else
                     {

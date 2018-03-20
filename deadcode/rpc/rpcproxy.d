@@ -1,9 +1,13 @@
 module deadcode.rpc.rpcproxy;
 
+import std.traits;
+
 import msgpack;
 
 import deadcode.core.future;
 import deadcode.rpc.rpc;
+import deadcode.rpc.rpccallback;
+
 //import deadcode.util.weakref : WeakRef;
 
 class RPCProxyBase
@@ -24,7 +28,7 @@ class RPCProxyBase
         this.packedID = packedID;
     }
 
-    private final string _setupRPCCall(string method)
+    private final string _setupRPCCall()
     {
         rpc.outBuffer.clear();
         string callID = rpc.newCallID();
@@ -32,14 +36,16 @@ class RPCProxyBase
         rpc.outBuffer ~= pack(true); // request
         rpc.outBuffer ~= packedType;
         rpc.outBuffer ~= packedID;
-        rpc.outBuffer ~= pack(method);
         return callID;
     }
 
-    private final auto asyncCallInternal(bool yieldCall = false, Args...)(string methodName, Args args)
+    private final auto _asyncCallInternal(bool yieldCall = false, Args...)(string methodName, Args args)
     {
         import core.thread : Fiber;
-        CallID callID = _setupRPCCall(methodName);
+        CallID callID = _setupRPCCall();
+        rpc.outBuffer ~= pack(methodName);
+        byte argCount = cast(byte) args.length;
+        rpc.outBuffer ~= pack(argCount);
 
         foreach (a; args)
         {
@@ -74,11 +80,18 @@ class RPCProxyBase
                             }
                             if (!ok)
                             {
-                                // Wrap the object in a weak reference and make it a service automatically
-                                import std.conv;
-                                Object o = cast(Object)a;
-                                auto ws = rpc.publish(a, o.toHash().to!string);
-                                rpc.outBuffer ~= ws.packedID;
+                                if (a is null)
+								{
+									rpc.outBuffer ~= pack("");
+								}
+								else
+								{
+									// Wrap the object in a weak reference and make it a service automatically
+									import std.conv;
+									Object o = cast(Object)a;
+									auto ws = rpc.publish(a, o.toHash().to!string);
+									rpc.outBuffer ~= ws.packedID;
+								}
                                 //import std.stdio;
                                 //writeln("RPC method interface arg is not proxy, service or object in a service but : ", methodName, " ", a);
                             }
@@ -98,6 +111,25 @@ class RPCProxyBase
                     rpc.outBuffer ~= proxyCasted.packedID;
                 }
             }
+			else static if (isDelegate!ArgType)
+			{
+				if (a is null)
+				{
+					rpc.outBuffer ~= pack("");
+				}
+				else
+				{
+					import std.conv;
+					static if (is(ReturnType!ArgType == void))
+						auto cb = createCallback(a);
+					else
+						auto cb = createCallbackReturn(a);
+
+					Object o = cast(Object) cb;
+					auto ws = rpc.publish(cb, o.toHash().to!string);
+					rpc.outBuffer ~= ws.packedID;
+				}
+			}
 			else
             {
 	            rpc.outBuffer ~= pack(a);
@@ -110,8 +142,11 @@ class RPCProxyBase
         rpc.registerCallID(callID, promise, yieldCall ? Fiber.getThis() : null);
 
         static if (yieldCall)
-            Fiber.yield();
-
+		{
+			if (Fiber.getThis() is null)
+				throw new Exception("Async RPC yielded call made but there is no active Fiber");
+			Fiber.yield();
+		}
         auto future = promise.getFuture();
 
         if (!rpc.isAlive && !future.isException)
@@ -120,9 +155,9 @@ class RPCProxyBase
         return future;
     }
 
-    final FutureVoid asyncCall(bool yieldCall = false, Args...)(string methodName, Args args)
+    final FutureVoid _asyncCall(bool yieldCall = false, Args...)(string methodName, Args args)
     {
-        auto future = asyncCallInternal!(yieldCall)(methodName, args);
+        auto future = _asyncCallInternal!(yieldCall)(methodName, args);
         return future.then((Unpacker unpacker) {
             RPC.CallStatus callStatus;
             unpacker.unpack(callStatus);
@@ -135,16 +170,16 @@ class RPCProxyBase
         });
     }
 
-    final void call(Args...)(string methodName, Args args)
+    final void _call(Args...)(string methodName, Args args)
     {
-        FutureVoid future = asyncCall!(true)(methodName, args);
+        FutureVoid future = _asyncCall!(true)(methodName, args);
         assert(future.isValid);
         future.get();
     }
 
-    final Future!Result asyncCall(Result, bool yieldCall = false, Args...)(string methodName, Args args)
+    final Future!Result _asyncCall(Result, bool yieldCall = false, Args...)(string methodName, Args args)
     {
-        auto future = asyncCallInternal!(yieldCall)(methodName, args);
+        auto future = _asyncCallInternal!(yieldCall)(methodName, args);
         return future.then((Unpacker unpacker) {
             RPC.CallStatus callStatus;
             unpacker.unpack(callStatus);
@@ -156,12 +191,23 @@ class RPCProxyBase
             enforce(callStatus == RPC.CallStatus.Success);
 
             Result ret;
-            import std.traits;
+            import std.range;
             static if ( is(Result == interface) )
             {
                 version (RPCTrace)
                     writeln("unpackingA ", Result.stringof, " ", methodName);
                 ret = rpc.create!Result(unpacker);
+            }
+            else static if ( isRandomAccessRange!Result && is(ElementType!Result == interface))
+            {
+                version (RPCTrace)
+                    writeln("unpackingA ", Result.stringof, " ", methodName);
+                alias ElmType = ElementType!Result;
+                int sz = 0;
+                unpacker.unpack(sz);
+                ret.length = sz;
+                foreach (i; 0..sz)
+                    ret[i] = rpc.create!ElmType(unpacker);
             }
             else
             {
@@ -173,9 +219,9 @@ class RPCProxyBase
         });
     }
 
-    final Result call(Result, Args...)(string methodName, Args args)
+    final Result _call(Result, Args...)(string methodName, Args args)
     {
-        auto future = asyncCall!(Result, true)(methodName, args);
+        auto future = _asyncCall!(Result, true)(methodName, args);
         assert(future.isValid);
         return future.get();
     }
@@ -216,12 +262,12 @@ mixin template CreateFunction(alias TemplateFunc, string functionBody)
     enum code = q{ReturnType!(TemplateFunc) %s(ParameterTuple!TemplateFunc) %s { 
         %s
     }}.format(__traits(identifier, TemplateFunc), funcAttrs, functionBody.format("TemplateFunc" /*fullyQualifiedName!TemplateFunc*/));
-    mixin(code);
+	// pragma(msg, code);
+	mixin(code);
 }
 
 template getAllMethods(I)
 {
-    import std.traits;
     import std.typetuple;
     import deadcode.core.traits : isMemberAccessible;
 
@@ -266,33 +312,41 @@ class RPCProxy(I) : RPCProxyBase, I
     // forwards as a rpc call. Skip interface template methods though, because that
     // doesn't make sense to proxy
     alias allMethods = getAllMethods!I;
+    
+	import std.array;
+    import std.typetuple;
 
     enum code = generateMethodImplementations!allMethods(RPCProxyMethodMixin);
-    mixin(code);
+   //	pragma(msg, code);
+
+	mixin(code);
 }
+
+mixin template IdentifiersToArgs(T...)
+{
+	import std.typetuple;
+	template Helper(int idx)
+	{
+		static if (idx == 0)
+			alias Helper = AliasSeq!();
+		else
+			alias Helper = AliasSeq!(Helper!(idx-1), mixin(T[idx-1]));
+	}
+	alias Args = Helper!(T.length);
+}
+
  // Identity!(%s);
 enum RPCProxyMethodMixin = q{
-    import std.array;
-    import std.traits;
-    import std.typetuple;
+
     alias Func = %s;
     enum Name = __FUNCTION__.split(".")[$-1];
     alias ArgsIdents = ParameterIdentifierTuple!Func;
+	mixin IdentifiersToArgs!ArgsIdents;
 
-    static if (ArgsIdents.length == 0)
-        alias Args = ArgsIdents;
-    else static if (ArgsIdents.length == 1)
-        alias Args =  AliasSeq!(mixin(ArgsIdents[0]));
-    else static if (ArgsIdents.length == 2)
-        alias Args = AliasSeq!(mixin(ArgsIdents[0]), mixin(ArgsIdents[1]));
-    else
-	{
-        pragma(msg, "Error: add support for more arguments in RPCProxyMethodMixin. " );
-	}
     alias RT = ReturnType!(Func);
     ThisType t = cast(ThisType) this; // cast away const for this
     static if(is (RT == void) )
-        t.call(Name, Args);
+        t._call(Name, Args);
     else
-        return t.call!RT(Name, Args);
+        return t._call!RT(Name, Args);
 };

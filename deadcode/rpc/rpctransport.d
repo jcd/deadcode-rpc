@@ -3,13 +3,15 @@ module deadcode.rpc.rpctransport;
 import deadcode.rpc.rpc;
 
 import core.thread : Fiber;
+import std.algorithm;
+import std.range;
 import std.socket;
 
 class RPCTransport
 {
     enum ReceiveError = Socket.ERROR;
 
-    private
+    package
     {
         RPCLoop _loop;
         Socket _socket;
@@ -49,6 +51,7 @@ class RPCLoop
     private
     {
         Socket _sock;
+		RPCSocketBuffer _sockBuffer;
         SocketSet _socketSet;
         enum MAX_CONNECTIONS = 40;
         struct Client
@@ -61,6 +64,11 @@ class RPCLoop
         Client[] _clients;
     }
 
+	@property RPCSocketBuffer listeningSocketBuffer()
+	{
+		return _sockBuffer;
+	}
+
     mixin Signal!() onConnectionsExceeded;
     
     // (reason if error)
@@ -70,6 +78,7 @@ class RPCLoop
     this()
     {
         _socketSet = new SocketSet(MAX_CONNECTIONS + 1);
+		_sockBuffer = new RPCSocketBuffer(socket_t.INVALID_SOCKET, 1024);
     }
 
     final void connect(string ip, ushort port)
@@ -90,8 +99,10 @@ class RPCLoop
         k.on = 0; 
         k.time = 2; // 2 seconds
         _sock.setOption(SocketOptionLevel.SOCKET, SocketOption.LINGER, k);
-        _sock.bind(new InternetAddress(port));
+		auto ia = new InternetAddress(port);
+        _sock.bind(ia);
         _sock.listen(10);
+		_sockBuffer.handle = _sock.handle;
     }
 
     final void stopListening()
@@ -100,6 +111,7 @@ class RPCLoop
         {
             _sock.close();
             _sock = null;
+			_sockBuffer.handle = socket_t.INVALID_SOCKET;
         }
     }
 
@@ -168,12 +180,15 @@ class RPCLoop
         //writeln("Selecting ", me);
         int selectResult = Socket.select(_socketSet, null, null);
 
-        processSockets(_socketSet);
+        readAndProcessSockets(_socketSet);
 
         return selectResult;
     }
 
-    final void processSockets(SocketSet socketSet)
+	// Read data from socketset and make any rpc calls/handle rpc returns for
+	// associated RPCs.
+    // See processMessages() for a version for pushing data.
+	final void readAndProcessSockets(SocketSet socketSet)
     {
         import std.stdio;
         foreach (size_t i, client; _clients)
@@ -208,14 +223,72 @@ class RPCLoop
                 if (clientSocket !is null)
                     clientSocket.close();
     
-            clientSocket = _sock.accept();
+			clientSocket = _sock.accept();
     
+			//
+			bool al = clientSocket.isAlive;
+	
             if (_clients.length == MAX_CONNECTIONS)
                 onConnectionsExceeded.emit();
             else 
                 registerConnection(clientSocket, true);
         }
     }
+
+	// Read data from socketMessages and make any rpc calls/handle rpc returns for
+	// associated RPCs.
+    // See processSockets() for a version for pushing data.
+	final void processSockets(socket_t[] socketSet)
+    {
+        import std.stdio;
+		foreach (size_t i, s; socketSet)
+		{
+			auto r = _clients.find!((a, b) => a.socket.handle == b)(s);
+            if (!r.empty)
+            {
+				auto client = r.front;
+                if (client.rpc.inBuffer.buffer.used == 0)
+                {
+                    if (client.rpc.isAlive)
+                    {
+                        //debug writeln("Client disconnected");
+                        onDisconnected.emit(client.rpc, "Remote end disconnected before receiving message finished");
+						client.rpc.kill();
+                    }
+                    else
+                    {
+                        //debug writeln("Client disconnected by kill");
+                        onDisconnected.emit(client.rpc, "Disconnect caused by rpc.kill()");
+                    }
+                }
+				else
+				{
+					client.rpc.processMessageBuffer();
+				}
+            }
+        }
+
+        if (_sock !is null && socketSet.canFind(_sock.handle))
+        {
+            Socket clientSocket = null;
+            scope (failure)
+                if (clientSocket !is null)
+                    clientSocket.close();
+
+			clientSocket = *(cast(Socket*)listeningSocketBuffer.buffer.data);
+			listeningSocketBuffer.buffer.used = 0;
+
+			bool al = clientSocket.isAlive;
+			socket_t as1 = _sock.handle;
+			socket_t as = clientSocket.handle;
+
+            if (_clients.length == MAX_CONNECTIONS)
+                onConnectionsExceeded.emit();
+            else 
+                registerConnection(clientSocket, true);
+        }
+    }
+
 
     bool addSockets(T)(ref T outputSockets)
     {
@@ -235,7 +308,7 @@ class RPCLoop
                 static if ( is(T == SocketSet) )
                     outputSockets.add(client.socket);
                 else
-                    outputSockets ~= client.socket.handle;
+                    outputSockets ~= client.rpc.inBuffer;
             }
         }
 
@@ -244,7 +317,7 @@ class RPCLoop
             static if ( is(T == SocketSet) )
                 outputSockets.add(_sock); // listening socket
             else
-                outputSockets ~= _sock.handle;
+                outputSockets ~= _sockBuffer;
         }
         else if (_clients.length == 0)
             return false;
