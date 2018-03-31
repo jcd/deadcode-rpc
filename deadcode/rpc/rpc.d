@@ -727,7 +727,7 @@ class RPCService(I) : IRPCService, I
                     else static if ( isRandomAccessRange!Returning && is(ElementType!Returning == interface))
                     {
                         alias ElmType = ElementType!Returning;
-                        int sz = result.length;
+                        int sz = cast(int)result.length;
                         resultData ~= pack(sz);
                         foreach (v; result)
                             appendServiceID!ElmType(v, _rpc, resultData);
