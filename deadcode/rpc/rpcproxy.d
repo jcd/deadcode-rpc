@@ -286,10 +286,12 @@ template getAllMethods(I)
     alias getAllMethods = Impl!0;
 }
 
+package alias Identity(alias A) = A;
+
 string generateMethodImplementations(allMethods...)(string methodBody)
 {
     import std.string :  format;
-    string res = "import std.traits : Identity;";
+    string res; // = "import std.traits : Identity;";
     foreach (idx, f; allMethods)
     {
         res ~= q{ 
