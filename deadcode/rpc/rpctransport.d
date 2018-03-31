@@ -7,6 +7,14 @@ import std.algorithm;
 import std.range;
 import std.socket;
 
+private 
+{
+    version (Windows)
+        auto INVALID_SOCKET = socket_t.INVALID_SOCKET;
+    else 
+        auto INVALID_SOCKET = -1;
+}
+
 class RPCTransport
 {
     enum ReceiveError = Socket.ERROR;
@@ -78,7 +86,7 @@ class RPCLoop
     this()
     {
         _socketSet = new SocketSet(MAX_CONNECTIONS + 1);
-		_sockBuffer = new RPCSocketBuffer(socket_t.INVALID_SOCKET, 1024);
+		_sockBuffer = new RPCSocketBuffer(INVALID_SOCKET, 1024);
     }
 
     final void connect(string ip, ushort port)
@@ -111,7 +119,7 @@ class RPCLoop
         {
             _sock.close();
             _sock = null;
-			_sockBuffer.handle = socket_t.INVALID_SOCKET;
+			_sockBuffer.handle = INVALID_SOCKET;
         }
     }
 
