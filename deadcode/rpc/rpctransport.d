@@ -10,9 +10,9 @@ import std.socket;
 private 
 {
     version (Windows)
-        auto INVALID_SOCKET = socket_t.INVALID_SOCKET;
+        socket_t INVALID_SOCKET = socket_t.INVALID_SOCKET;
     else 
-        auto INVALID_SOCKET = -1;
+        socket_t INVALID_SOCKET = -1;
 }
 
 class RPCTransport
