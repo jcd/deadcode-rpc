@@ -12,6 +12,7 @@ import std.typetuple;
 
 import deadcode.core.future;
 import deadcode.core.signals;
+import deadcode.core.traits : Identity;
 //import deadcode.core.weakref : WeakRef;
 import deadcode.rpc.rpccallback;
 import deadcode.rpc.rpcproxy : RPCProxy, getAllMethods, generateMethodImplementations, CreateFunction, JoinStrings, ParameterTuple;

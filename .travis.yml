@@ -11,5 +11,6 @@ script:
  - perl citools/clone-dub-deps.pl
  - dub test -b unittest-cov --compiler=${DC}
 after_success:
+ - rdmd citools/fixupCoverage.d
  - bash <(curl -s https://codecov.io/bash)
  - if [ $DC = dmd ]; then perl citools/on-success.pl api ; fi
