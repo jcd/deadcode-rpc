@@ -5,7 +5,7 @@
 	"homepage": "http://deadcode.steamwinter.com",
 	"license": "Boost v1",
     "targetType": "library",
-    "sourcePaths": [ "." ],
+    "sourcePaths": [ "deadcode" ],
     "importPaths": [ "." ],
 	"dependencies": {
 		"deadcode-core": ">=0.0.0",
